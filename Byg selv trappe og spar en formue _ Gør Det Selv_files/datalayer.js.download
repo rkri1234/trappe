@@ -1,0 +1,258 @@
+if(typeof(gtmTwentyThreeLoaded)=='undefined' || !gtmTwentyThreeLoaded) {
+  var gtmTwentyThreeVideos = [];
+  (function($d,$w){
+    var $this = this;
+    var requireDomain = $w.twentythreeDomain || location.hostname;
+    var sourceMatch = $w.twentyThreeSourceMatch || /\/[^/]+\.ihtml\/player\.html/;
+    var percentileGranularity = $w.twentyThreePercentileGranularity || 25;
+    var engagementGranularity = $w.twentyThreeEngagementGranularity || 10;
+    var dataLayer = ($w.twentyThreeDataLayer||$w.dataLayer);
+    var limitEvents = ($w.twentyThreeLimitEvents||[]);
+    var customVideoFields = ($w.twentyThreeCustomVideoFields||[]);
+    var fireSpecialFirstEvents = (typeof($w.twentyThreeFireSpecialFirstEvents)=='boolean' ? $w.twentyThreeFireSpecialFirstEvents : true);
+    var videos = $w.gtmTwentyThreeVideos;
+    var gtmTrackingContext = 'unknown';
+    dataLayer.videos = videos;
+
+    // Get percentile
+    var percentile = function(currentTime, duration, percentileGranularity){
+      var percentile = 0;
+      try {
+        duration = new Number(duration)-1;
+        var percentile = Math.floor((100.0/percentileGranularity)*currentTime/duration) * percentileGranularity;
+      }catch(e){};
+      return (isNaN(percentile) ? 0 : percentile);
+    }
+    // Get engagement
+    var engagement = function(engagement){
+      var ret = 0;
+      try {
+        ret = Math.floor(engagement/(engagementGranularity*1.0)) * engagementGranularity;
+      }catch(e){};
+      return (isNaN(ret) ? 0 : ret);
+    }
+
+    // Get a bunch of baseline properties from the Player
+    var videoProperties = function(Player, callback){
+      var returned = false;
+      var video = {trackingContext:gtmTrackingContext};
+      var _ = {
+        photo_id:'video_photo_id',
+        live_id:'video_live_id',
+        full_video:'video',
+        title:'video_title',
+        content:'video_content',
+        type:'video_type',
+        currentTime:'currentTime',
+        duration:'duration',
+        link:'url',
+        domain:'domain',
+        player_id:'player_id',
+        quality:'quality',
+        playing:'playing',
+        currentVideoEngagement:'currentVideoEngagement',
+        totalEngagement:'totalEngagement'
+      }
+      for(key in _) {
+        (function(key){
+          Player.get(_[key], function(value){
+            if(key=='type') {
+              video['type'] = (value=='stream' ? 'live' : 'ondemand'); // normalize type for the video
+            } else if(key=='full_video') {
+              if(value) {
+                video['tags'] = value.tags;
+                video['category'] = value.album_title;
+
+                // Support for custom video fields
+                for(i in customVideoFields) {
+                  customKey = customVideoFields[i];
+                  video[customKey] = (typeof(value[customKey])!='undefined' ? value[customKey] : '');
+                }
+              }
+            } else {
+              video[key] = value;
+            }
+            _[key] = null;
+            for(x in _) {
+              if(returned || _[x]!=null) break;
+
+              // Normalize ID, tags and album
+              video['id'] = video['live_id']||video['photo_id'];
+
+              // Set the percentile
+              video['percentile'] = percentile(video.currentTime, video.duration, percentileGranularity);
+
+              // Set granularity for engagement
+              video['currentVideoEngagement'] = engagement(video['currentVideoEngagement']);
+              video['totalEngagement'] = engagement(video['totalEngagement']);
+
+              // Call back to the context
+              callback(video);
+              returned = true;
+            }
+          });
+        })(key);
+      }
+    };
+
+    // Proxy events pushed to dataLayer and allow event white-listing
+    var firedEvents = {};
+    var fireEvent = function(e){
+      if(limitEvents.length>0 && limitEvents.indexOf(e.event)<0) return;
+      dataLayer.push(e);
+      var fireFirstEvent = (fireSpecialFirstEvents && !firedEvents[e.event]);
+      firedEvents[e.event] = true;
+
+      if(fireFirstEvent) {
+        var firstEvent = e;
+        firstEvent.event += ':first';
+        dataLayer.push(firstEvent);
+      }
+    }
+
+    // Find players in the page to listen for
+    var findPlayers = function(_glueframe){
+      var GlueFrame = _glueframe||window.GlueFrame;
+      if(typeof(GlueFrame)!='function') {
+        console.log('GTM: TwentyThree GlueFrame was not loaded correctly');
+        return;
+      }
+      var frames = $d.getElementsByTagName('iframe');
+      for(i in frames) {
+        if(frames[i] && frames[i].src && sourceMatch.test(frames[i].src)) {
+          if(frames[i].getAttribute('data-twentythree-gtm')!='yes') {
+            var Player = new GlueFrame(frames[i], "Player");
+            listenToPlayer(Player);
+            frames[i].setAttribute('data-twentythree-gtm', 'yes');
+          }
+        } else {
+        }
+      }
+    }
+    $w.twentyThreeUpdateGTMPlayers = findPlayers;
+
+    // Hook into the event loop for a player
+    var listenToPlayer = function(_player){
+      var Player = _player;
+      var firedVideoPlayStart = false;
+      videoProperties(Player, function(video){
+        // Push data and event about the video for dataLayer
+        videos.push(video);
+        dataLayer.video = videos[0];
+        fireEvent({event:'video:change', video:video});
+        fireEvent({event:'video:metadatachange', video:video});
+
+        // Listen for updates to clip and metadata
+        Player.bind('player:video:loaded', function(){
+          videoProperties(Player, function(updatedVideo){
+            if(video.id!=updatedVideo.id) fireEvent({event:'video:change', video:updatedVideo});
+            video = updatedVideo;
+            dataLayer.video = video;
+            firedVideoPlayStart = false;
+            fireEvent({event:'video:metadatachange', video:video});
+          });
+        });
+
+        // Listen for updates to quality
+        Player.bind('player:video:qualitychange player:video:sourcechange', function(){
+          Player.get('quality', function(q){
+            video['quality'] = q;
+            fireEvent({event:'video:qualitychange', video:video});
+          });
+        });
+
+        // Listen for updates to currentTime
+        Player.bind('player:video:timeupdate', function(){
+          Player.get('currentTime', function(ct){
+            video['currentTime'] = ct;
+            var p = percentile(video.currentTime, video.duration, percentileGranularity);
+            var percentileChanged = false;
+            if(video['percentile']!=p) {
+              video['percentile'] = p;
+              percentileChanged = true;
+            }
+            fireEvent({event:'video:timeupdate', video:video});
+            if(percentileChanged) fireEvent({event:'video:percentileupdate', video:video});
+          });
+        });
+
+        // Listen for updates to engagement
+        Player.bind('player:engagementupdate', function(e, totalEngagement){
+          Player.get('currentVideoEngagement', function(currentVideoEngagement){
+            currentVideoEngagement = engagement(currentVideoEngagement);
+            if(currentVideoEngagement>0 && video['currentVideoEngagement']!=currentVideoEngagement) {
+              video['currentVideoEngagement'] = currentVideoEngagement;
+              fireEvent({event:'video:videoengagementupdate', video:video});
+            }
+            totalEngagement = engagement(totalEngagement);
+            if(totalEngagement>0 && video['totalEngagement']!=totalEngagement) {
+              video['totalEngagement'] = totalEngagement;
+              fireEvent({event:'video:totalengagementupdate', video:video});
+            }
+          });
+        });
+
+        // Ended
+        Player.bind('player:video:ended', function(e){
+          video['playing'] = false;
+          if(video['percentile']!=100) {
+            video['percentile'] = 100;
+            fireEvent({event:'video:percentileupdate', video:video});
+          }
+          fireEvent({event:'video:complete', video:video});
+        });
+
+        // Play/pause
+        Player.bind('player:video:play player:video:pause player:video:playing', function(e){
+          var originalEvent = e;
+          var event = (e=='player:video:pause' ? 'video:pause' : 'video:play');
+          Player.get('playing', function(p){
+            video['playing'] = p;
+            if(p && !firedVideoPlayStart) {
+              fireEvent({event:'video:playstart', video:video});
+              firedVideoPlayStart = true;
+            }
+            fireEvent({event:event, video:video});
+            if(originalEvent=='player:video:playing') {
+              fireEvent({event:'video:playing', video:video});
+            }
+          });
+        });
+
+        // Collector information
+        Player.bind('player:tracking:data', function(e, data){
+          if(data.source=='corepeople') {
+            var d = data;
+            d.event = 'video:collectordata';
+            fireEvent(d);
+          }
+        });
+      });
+    };
+
+    // Handle communication through GlueFrame
+    if(typeof(Player)!='undefined' && Player && typeof(Player.alias)!='undefined' && Player.alias=='player') {
+      var gtmTrackingContext = 'player';
+      listenToPlayer({
+        get:function(k,cb){
+          cb(Player.get(k));
+        },
+        bind:Player.bind
+      });
+    } else {
+      var gtmTrackingContext = 'web';
+      $w.onGlueFrameAvailable = function($gf){
+        findPlayers($gf);
+      }
+      var require = function(src,async){
+        var s=$d.createElement('script');
+        s.async=(async?1:0);
+        s.src=src;
+        var p = $d.getElementsByTagName('script')[0];
+        p.parentNode.insertBefore(s,p);
+      }
+      require('//'+requireDomain+'/resources/um/integrations/google-tag-manager/glueframe-1.1.3.js', false);
+    }
+  })(document,window);
+};
+gtmTwentyThreeLoaded = true;
